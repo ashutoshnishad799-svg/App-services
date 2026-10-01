@@ -111,10 +111,10 @@ class LockService : AccessibilityService() {
         if (now < store.pausedUntil) return null
         val game = isGame(pkg)
         if (now < store.focusUntil && (pkg in store.focusApps || game))
-            return "Focus mode on hai\n${(store.focusUntil - now) / 60000 + 1} min baaki"
+            return "Focus mode is on\n${(store.focusUntil - now) / 60000 + 1} min left"
         val lim = store.limitOf(pkg)
-        if (lim > 0 && usedNow(pkg) >= lim * 60_000L) return "Aaj ka $lim min ka limit khatam"
-        if (game && store.gameLimit > 0 && usedNow("@games") >= store.gameLimit * 60_000L) return "Games ka daily limit khatam"
+        if (lim > 0 && usedNow(pkg) >= lim * 60_000L) return "Daily limit of $lim min reached"
+        if (game && store.gameLimit > 0 && usedNow("@games") >= store.gameLimit * 60_000L) return "Games daily limit reached"
         return null
     }
 

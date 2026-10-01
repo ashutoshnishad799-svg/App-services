@@ -9,8 +9,8 @@ Glassmorphism + gradient App Lock & Hider. Accessibility + Shizuku. Open source 
 - Hider via Shizuku (hide / unhide), works for any launcher app
 
 ## Build (no PC needed)
-1. Push this folder to a GitHub repo. 2. Actions tab -> "Build APK" -> Run workflow.
-3. Download the `AshuLock-debug-apk` artifact and install. Or: Android Studio -> Open -> Run.
+1. Push this folder to a GitHub repo. 2. Actions tab -> "Build release APK" -> Run workflow.
+3. Download the `AshuLock-release-apk` artifact and install. Or: Android Studio -> Open -> Run.
 Then: enable the accessibility service (OFF/ON after every update), set a lock, pick apps.
 
 ## Notes

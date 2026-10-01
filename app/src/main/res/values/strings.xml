@@ -1,4 +1,4 @@
 <resources>
     <string name="app_name">Ashu AppLock</string>
-    <string name="a11y_desc">App open hote hi lock screen dikhane ke liye. Screen sirf Reels/Shorts pehchanne ke liye padhi jaati hai, kuch save ya share nahi hota.</string>
+    <string name="a11y_desc">Shows the lock screen the moment a locked app opens. The screen is read only to detect Reels and Shorts; nothing is saved or shared.</string>
 </resources>

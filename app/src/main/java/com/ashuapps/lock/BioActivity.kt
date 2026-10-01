@@ -12,7 +12,7 @@ class BioActivity : FragmentActivity() {
         super.onCreate(savedInstanceState)
         val info = BiometricPrompt.PromptInfo.Builder()
             .setTitle("Unlock")
-            .setNegativeButtonText("Lock use karo")
+            .setNegativeButtonText("Use passcode")
             .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
             .build()
         BiometricPrompt(this, ContextCompat.getMainExecutor(this), object : BiometricPrompt.AuthenticationCallback() {

@@ -11,6 +11,7 @@ import kotlin.math.hypot
 /** 3x3 pattern pad. Reports the dot order as digits "1".."9", so it reuses the PIN hash/check. */
 class PatternView(c: Context) : View(c) {
     var onDone: (String) -> Unit = {}
+    var tint = Color.WHITE // set from the theme
     private val d = resources.displayMetrics.density
     private val path = ArrayList<Int>()
     private var dragging = false
@@ -25,6 +26,7 @@ class PatternView(c: Context) : View(c) {
     private fun cy(i: Int) = height / 6f * (2 * (i / 3) + 1)
 
     override fun onDraw(cv: Canvas) {
+        dot.color = tint; line.color = (tint and 0xFFFFFF) or (0xCC shl 24)
         for (k in 1 until path.size) cv.drawLine(cx(path[k - 1]), cy(path[k - 1]), cx(path[k]), cy(path[k]), line)
         if (dragging && path.isNotEmpty()) cv.drawLine(cx(path.last()), cy(path.last()), fx, fy, line)
         for (i in 0..8) cv.drawCircle(cx(i), cy(i), (if (i in path) 11 else 6) * d, dot)

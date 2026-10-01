@@ -10,9 +10,25 @@ android {
         applicationId = "com.ashuapps.lock"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.2.0"
     }
+    val ks = System.getenv("KEYSTORE_FILE") // set by the GitHub workflow
+    signingConfigs {
+        if (ks != null) create("release") {
+            storeFile = file(ks)
+            storePassword = System.getenv("KEYSTORE_PASSWORD")
+            keyAlias = System.getenv("KEY_ALIAS")
+            keyPassword = System.getenv("KEY_PASSWORD")
+        }
+    }
+    buildTypes {
+        release {
+            isMinifyEnabled = false // Shizuku calls use reflection, keep R8 off
+            signingConfig = signingConfigs.getByName(if (ks != null) "release" else "debug")
+        }
+    }
+    lint { checkReleaseBuilds = false; abortOnError = false }
     buildFeatures { compose = true }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
     kotlinOptions { jvmTarget = "17" }
