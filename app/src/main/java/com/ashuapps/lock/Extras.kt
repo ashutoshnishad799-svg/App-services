@@ -152,7 +152,8 @@ internal fun Credential(type: Int, autoLen: Int, onSubmit: (String) -> Unit) {
     var cur by remember { mutableStateOf("") }
     var warn by remember { mutableStateOf("") }
     fun press(c: String) {
-        if (cur.length < (if (autoLen > 0) autoLen else 6)) cur += c
+        val maxLen = if (autoLen > 0) autoLen else 6
+        if (cur.length < maxLen) cur += c
         if (autoLen > 0 && cur.length == autoLen) { val s = cur; cur = ""; onSubmit(s) }
     }
     when (type) {
