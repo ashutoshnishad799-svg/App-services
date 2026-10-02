@@ -1,4 +1,4 @@
 <resources>
     <string name="app_name">Ashu AppLock</string>
-    <string name="a11y_desc">Shows the lock screen the moment a locked app opens. The screen is read only to detect Reels, Shorts and Recents cards, and volume keys only for the vault shortcut. Nothing is saved or shared.</string>
+    <string name="a11y_desc">Shows the lock screen the moment a locked app opens. The screen is read to detect Reels, Shorts and the Recents screen, typed text only to spot your vault dial code, and volume keys only for the vault shortcut. Nothing is saved or shared.</string>
 </resources>

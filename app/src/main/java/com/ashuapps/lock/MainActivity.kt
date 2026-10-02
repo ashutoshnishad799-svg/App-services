@@ -49,6 +49,14 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import android.content.BroadcastReceiver
+import android.content.IntentFilter
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.fragment.app.FragmentActivity
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import android.content.Context
 import android.view.WindowManager
 import androidx.activity.compose.BackHandler
@@ -59,20 +67,21 @@ import java.io.File
 import kotlin.concurrent.thread
 import kotlinx.coroutines.launch
 
-class MainActivity : ComponentActivity() {
+class MainActivity : FragmentActivity() {
     private var tick by mutableIntStateOf(0)
+    private var appLocked by mutableStateOf(false)
+    private lateinit var store: LockStore
+
     override fun onResume() { super.onResume(); tick++ } // re-check service / Shizuku state when returning
+    override fun onStop() { super.onStop(); if (store.lockSelf && store.hasPin()) appLocked = true }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        val store = LockStore(this)
+        store = LockStore(this)
         if (store.secureMain) window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
-        val apps = packageManager
-            .queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
-            .map { it.activityInfo.packageName to it.loadLabel(packageManager).toString() }
-            .filter { it.first != packageName }.distinctBy { it.first }.sortedBy { it.second.lowercase() }
-        setContent { App(store, apps, tick) }
+        appLocked = store.lockSelf && store.hasPin()
+        setContent { App(store, tick, appLocked, { askFinger(it) }) { appLocked = false } }
     }
 }
 
@@ -123,16 +132,51 @@ internal fun Themed(pal: Pal, content: @Composable () -> Unit) {
     }
 }
 
+private fun loadApps(ctx: Context): List<Pair<String, String>> {
+    val pm = ctx.packageManager
+    return pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
+        .map { it.activityInfo.packageName to it.loadLabel(pm).toString() }
+        .filter { it.first != ctx.packageName }.distinctBy { it.first }.sortedBy { it.second.lowercase() }
+}
+
+/** Full-screen layer above the pages that swallows touches (gate / setup screens). */
 @Composable
-private fun App(store: LockStore, apps: List<Pair<String, String>>, tick: Int) {
+private fun Cover(content: @Composable () -> Unit) {
+    val pal = LocalPal.current
+    Box(Modifier.fillMaxSize().background(bgBrush(pal)).pointerInput(Unit) { detectTapGestures { } }) { content() }
+}
+
+@Composable
+private fun App(store: LockStore, tick: Int, appLocked: Boolean, askFinger: (() -> Unit) -> Unit, onUnlocked: () -> Unit) {
+    val ctx = LocalContext.current
     var themeId by remember { mutableStateOf(store.theme) }
-    var setup by remember { mutableStateOf<Int?>(null) } // lock type being set up (full-screen flow)
+    var setup by remember { mutableStateOf<Int?>(null) }          // lock type being set up (full-screen flow)
+    var gate by remember { mutableStateOf<(() -> Unit)?>(null) }   // action waiting for the passcode
+    var apps by remember { mutableStateOf(emptyList<Pair<String, String>>()) }
+    var refresh by remember { mutableIntStateOf(0) }
     val pager = rememberPagerState { NAV.size }
-    BackHandler(enabled = setup != null) { setup = null }
+    BackHandler(enabled = setup != null || gate != null) { setup = null; gate = null }
+    LaunchedEffect(refresh, tick) { // app list is loaded off the main thread and refreshed on hide / unhide / install
+        if (refresh > 0) delay(250)
+        val fresh = withContext(Dispatchers.IO) { loadApps(ctx) }
+        if (fresh != apps) apps = fresh
+    }
+    DisposableEffect(Unit) {
+        val r = object : BroadcastReceiver() { override fun onReceive(c: Context, i: Intent) { refresh++ } }
+        ctx.registerReceiver(r, IntentFilter().apply {
+            addAction(Intent.ACTION_PACKAGE_ADDED); addAction(Intent.ACTION_PACKAGE_REMOVED)
+            addAction(Intent.ACTION_PACKAGE_CHANGED); addDataScheme("package")
+        })
+        onDispose { ctx.unregisterReceiver(r) }
+    }
+    val askPin: (() -> Unit) -> Unit = { action -> if (store.hasPin()) gate = action else action() }
     Themed(Themes.of(themeId)) {
-        val t = setup
-        if (t == null) Shell(store, apps, tick, pager, themeId, { setup = it }) { themeId = it; store.theme = it }
-        else PasscodeSetup(t, store) { setup = null }
+        Shell(store, apps, tick, pager, themeId, askPin, { refresh++ }, { setup = it }) { themeId = it; store.theme = it }
+        val g = gate
+        val s = setup
+        if (appLocked) Cover { GateScreen(store, "Ashu AppLock", askFinger, null) { onUnlocked() } }
+        else if (g != null) Cover { GateScreen(store, "Enter passcode", askFinger, { gate = null }) { gate = null; g() } }
+        else if (s != null) Cover { PasscodeSetup(s, store) { setup = null } }
     }
 }
 
@@ -145,7 +189,7 @@ private fun Orb(c: Color, m: Modifier) {
 @Composable
 private fun Shell(
     store: LockStore, apps: List<Pair<String, String>>, tick: Int, pager: PagerState, themeId: Int,
-    openSetup: (Int) -> Unit, setTheme: (Int) -> Unit
+    askPin: (() -> Unit) -> Unit, onChanged: () -> Unit, openSetup: (Int) -> Unit, setTheme: (Int) -> Unit
 ) {
     val pal = LocalPal.current
     val scope = rememberCoroutineScope()
@@ -156,13 +200,13 @@ private fun Shell(
         HorizontalPager(state = pager, modifier = Modifier.weight(1f)) { i ->
             when (i) {
                 0 -> LockPage(store, apps, tick)
-                1 -> HidePage(store, apps, tick)
+                1 -> HidePage(store, apps, tick, askPin, onChanged)
                 2 -> PasscodePage(store, openSetup)
                 3 -> FocusPage(store, apps)
                 4 -> TimersPage(store, apps)
                 5 -> ReelsPage(store)
                 6 -> GamesPage(store, apps)
-                7 -> IntruderPage(store, tick)
+                7 -> IntruderPage(store, tick, askPin)
                 8 -> ThemesPage(themeId, setTheme)
                 else -> AboutPage()
             }
@@ -234,11 +278,10 @@ private fun Toggle(title: String, sub: String?, checked: Boolean, onChange: (Boo
 /** One glass row per installed app, with a page-specific control on the right. */
 private fun LazyListScope.appRows(apps: List<Pair<String, String>>, trailing: @Composable (String, String) -> Unit) {
     items(apps, key = { it.first }) { (pkg, name) ->
-        val ctx = LocalContext.current
-        val icon = remember(pkg) { ctx.packageManager.getApplicationIcon(pkg).toBitmap(96, 96).asImageBitmap() }
+        val icon = rememberIcon(pkg)
         Panel(pad = 12) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Image(icon, null, Modifier.size(40.dp))
+                if (icon != null) Image(icon, null, Modifier.size(40.dp)) else Spacer(Modifier.size(40.dp))
                 Text(name, Modifier.weight(1f).padding(horizontal = 12.dp), maxLines = 1)
                 trailing(pkg, name)
             }
@@ -271,12 +314,26 @@ private fun LockPage(store: LockStore, apps: List<Pair<String, String>>, tick: I
 }
 
 @Composable
-private fun HidePage(store: LockStore, apps: List<Pair<String, String>>, tick: Int) {
+private fun HidePage(
+    store: LockStore, apps: List<Pair<String, String>>, tick: Int,
+    askPin: (() -> Unit) -> Unit, onChanged: () -> Unit
+) {
     val ctx = LocalContext.current
     val sub = Color(LocalPal.current.sub)
     var hidden by remember { mutableStateOf(store.hidden) }
     var vol by remember { mutableStateOf(store.volVault) }
+    var dial by remember { mutableStateOf(store.dialVault) }
     val ok = tick >= 0 && Sh.ready()
+    // an app only leaves the "hidden" list once it is verified visible again, so it can never get lost
+    fun unhide(h: String) = thread {
+        if (Sh.unhide(h.substringBefore('|'))) { hidden = hidden - h; store.hidden = hidden; onChanged() }
+        else toast(ctx, "Could not unhide: ${Sh.last.take(140)}")
+    }
+    fun hide(pkg: String, name: String) = thread {
+        saveIcon(ctx, pkg)
+        if (Sh.hide(pkg)) { hidden = hidden + "$pkg|$name"; store.hidden = hidden; onChanged() }
+        else toast(ctx, "Could not hide: ${Sh.last.take(140)}")
+    }
     PageList("Hide Apps", "Remove apps from the launcher with Shizuku and open them from the vault.") {
         item {
             Panel {
@@ -289,27 +346,24 @@ private fun HidePage(store: LockStore, apps: List<Pair<String, String>>, tick: I
                 Text("Hidden apps vault", fontWeight = FontWeight.Bold)
                 Text("Open hidden apps after your passcode. They hide again when you leave them.", fontSize = 12.sp, color = sub)
                 Button({ ctx.startActivity(Intent(ctx, VaultActivity::class.java)) }) { Text("Open vault") }
-                Toggle("Volume shortcut", "Press Volume Up, Volume Up, Volume Down quickly to open the vault", vol) {
-                    vol = it; store.volVault = it
+                Toggle("Dial code", "Type *#*#YOUR PIN#*#* in any phone app. Works with PIN or pattern lock.", dial) {
+                    dial = it; store.dialVault = it
                 }
-                Text("You can also dial *#*#2748#*#* in your phone app.", fontSize = 12.sp, color = sub)
+                Toggle("Volume shortcut", "Press Volume Up, Volume Up, Volume Down quickly", vol) { vol = it; store.volVault = it }
             }
         }
         if (hidden.isNotEmpty()) item { Text("Hidden apps", fontWeight = FontWeight.Bold) }
         items(hidden.toList()) { h ->
-            val (pkg, label) = h.split("|", limit = 2)
             Panel(pad = 12) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(label, Modifier.weight(1f))
-                    TextButton({ thread { if (Sh.unhide(pkg)) { hidden = hidden - h; store.hidden = hidden } } }, enabled = ok) { Text("Unhide") }
+                    Text(h.substringAfter('|'), Modifier.weight(1f))
+                    TextButton({ askPin { unhide(h) } }, enabled = ok) { Text("Unhide") }
                 }
             }
         }
         item { Text("Visible apps", fontWeight = FontWeight.Bold) }
         appRows(apps.filter { a -> hidden.none { it.startsWith(a.first + "|") } }) { pkg, name ->
-            TextButton({
-                thread { saveIcon(ctx, pkg); if (Sh.hide(pkg)) { hidden = hidden + "$pkg|$name"; store.hidden = hidden } }
-            }, enabled = ok) { Text("Hide") }
+            TextButton({ hide(pkg, name) }, enabled = ok) { Text("Hide") }
         }
     }
 }
@@ -323,7 +377,9 @@ private fun PasscodePage(store: LockStore, openSetup: (Int) -> Unit) {
     var close by remember { mutableStateOf(store.relockOnClose) }
     var off by remember { mutableStateOf(store.relockOnScreenOff) }
     var bio by remember { mutableStateOf(store.autoBio) }
-    var rec by remember { mutableStateOf(store.recentsBlur) }
+    var self by remember { mutableStateOf(store.lockSelf) }
+    var kill by remember { mutableStateOf(store.killLocked) }
+    var mode by remember { mutableStateOf(store.recentsMode) }
     var secure by remember { mutableStateOf(store.secureMain) }
     PageList("Passcode", "Choose how locked apps are unlocked.") {
         item {
@@ -348,11 +404,25 @@ private fun PasscodePage(store: LockStore, openSetup: (Int) -> Unit) {
                 Toggle("Relock when the app closes", null, close) { close = it; store.relockOnClose = it }
                 Toggle("Relock after the screen turns off", null, off) { off = it; store.relockOnScreenOff = it }
                 Toggle("Fingerprint unlock", "Shows the fingerprint prompt as soon as the lock appears", bio) { bio = it; store.autoBio = it }
+                Toggle("Lock this app too", "Ask for the passcode whenever Ashu AppLock opens", self) { self = it; store.lockSelf = it }
             }
         }
         item {
             Panel {
-                Toggle("Blur locked apps in Recents", "Covers their cards in the app switcher (best effort)", rec) { rec = it; store.recentsBlur = it }
+                Text("Recents privacy", fontWeight = FontWeight.Bold)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf("Off", "Smart", "Strict").forEachIndexed { i, n ->
+                        FilterChip(mode == i, { mode = i; store.recentsMode = i }, { Text(n) })
+                    }
+                }
+                Text(
+                    listOf("Locked apps stay visible in Recents.",
+                        "Covers each locked app card. Can lag a little while you swipe.",
+                        "Blurs the whole card row the moment a locked app is in Recents. Nothing leaks.")[mode],
+                    fontSize = 12.sp, color = Color(pal.sub))
+                Toggle("Close locked apps when you leave them", "Removes them from Recents completely. Needs Shizuku.", kill) {
+                    kill = it; store.killLocked = it
+                }
                 Toggle("Hide this app in Recents", "Also blocks screenshots of this app", secure) {
                     secure = it; store.secureMain = it
                     if (it) act.window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
@@ -365,25 +435,61 @@ private fun PasscodePage(store: LockStore, openSetup: (Int) -> Unit) {
 
 @Composable
 private fun FocusPage(store: LockStore, apps: List<Pair<String, String>>) {
+    val sub = Color(LocalPal.current.sub)
+    val now = rememberNow()
     var until by remember { mutableStateOf(store.focusUntil) }
+    var total by remember { mutableStateOf(store.focusTotal) }
     var sel by remember { mutableStateOf(store.focusApps) }
-    val now = System.currentTimeMillis()
+    var mins by remember { mutableStateOf(25) }
+    var own by remember { mutableStateOf(store.appFocus) }
+    var pick by remember { mutableStateOf<Pair<String, String>?>(null) } // app whose own timer is being set
     val on = until > now
-    PageList("Focus Mode", "Block distracting apps (and every game) for a set time.") {
+    pick?.let { (pkg, name) ->
+        var m by remember(pkg) { mutableStateOf(15) }
+        val end = store.appFocusEnd(pkg)
+        AlertDialog(
+            onDismissRequest = { pick = null },
+            title = { Text(name) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(if (end > now) "Blocked for ${fmtClock(end - now)} more" else "Block this app for", fontSize = 13.sp)
+                    DurationPicker(listOf(5, 10, 15, 20, 30, 45, 60, 90, 120), m, 3) { m = it }
+                }
+            },
+            confirmButton = {
+                Button({ store.setAppFocus(pkg, System.currentTimeMillis() + m * 60_000L); own = store.appFocus; pick = null }) {
+                    Text("Start ${fmtMin(m)}")
+                }
+            },
+            dismissButton = {
+                if (end > now) TextButton({ store.setAppFocus(pkg, 0); own = store.appFocus; pick = null }) { Text("Clear") }
+                else TextButton({ pick = null }) { Text("Cancel") }
+            })
+    }
+    PageList("Focus Mode", "Block apps for a set time. Games are blocked too.") {
         item {
             Panel {
-                Text(if (on) "Focus is on · ${(until - now) / 60000 + 1} min left" else "Start a focus session",
-                    fontWeight = FontWeight.Bold)
-                if (on) Button({ until = 0; store.focusUntil = 0 }) { Text("Stop") }
-                else Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf(25, 45, 60, 90).forEach { m ->
-                        Button({ until = System.currentTimeMillis() + m * 60_000L; store.focusUntil = until }) { Text("${m}m") }
-                    }
+                Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                    ClockRing(
+                        if (on && total > 0) (until - now).toFloat() / total else 1f,
+                        if (on) fmtClock(until - now) else fmtClock(mins * 60_000L),
+                        if (on) "ends ${fmtTime(until)}" else "session length")
+                }
+                if (on) Button({ until = 0; store.focusUntil = 0 }, Modifier.fillMaxWidth()) { Text("Stop focus") }
+                else {
+                    DurationPicker(listOf(5, 10, 15, 25, 30, 45, 60, 90), mins) { mins = it }
+                    Button({
+                        val t = mins * 60_000L
+                        until = System.currentTimeMillis() + t; total = t
+                        store.focusUntil = until; store.focusTotal = t
+                    }, Modifier.fillMaxWidth()) { Text("Start focus") }
                 }
             }
         }
-        item { Text("Apps blocked during focus", fontWeight = FontWeight.Bold) }
-        appRows(apps) { pkg, _ ->
+        item { Text("Tick the apps this session blocks, or tap an app's timer to block just that app on its own clock.", fontSize = 12.sp, color = sub) }
+        appRows(apps) { pkg, name ->
+            val end = own.firstOrNull { it.startsWith("$pkg|") }?.substringAfter('|')?.toLongOrNull() ?: 0L
+            TextButton({ pick = pkg to name }) { Text(if (end > now) fmtClock(end - now) else "Timer") }
             Checkbox(pkg in sel, { sel = if (it) sel + pkg else sel - pkg; store.focusApps = sel })
         }
     }
@@ -401,19 +507,15 @@ private fun TimersPage(store: LockStore, apps: List<Pair<String, String>>) {
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     val cur = remember(limits) { store.limitOf(pkg) }
-                    Text("Daily limit")
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        listOf(0, 15, 30, 60, 120).forEach { m ->
-                            FilterChip(cur == m, { store.setLimit(pkg, m); limits = store.limits }, { Text(if (m == 0) "Off" else "${m}m") })
-                        }
-                    }
+                    Text("Daily limit", fontSize = 13.sp)
+                    DurationPicker(listOf(0, 5, 10, 15, 20, 30, 45, 60, 90, 120, 180), cur, 3) { store.setLimit(pkg, it); limits = store.limits }
                 }
             })
     }
-    PageList("App Timers", "Set a daily time limit for any app.") {
+    PageList("App Timers", "Daily time limit per app. Pick a preset or type your own minutes.") {
         appRows(apps) { pkg, name ->
-            val m = limits.firstOrNull { it.startsWith("$pkg|") }?.substringAfter('|')
-            TextButton({ pick = pkg to name }) { Text(if (m == null) "Off" else "${m}m") }
+            val m = limits.firstOrNull { it.startsWith("$pkg|") }?.substringAfter('|')?.toIntOrNull() ?: 0
+            TextButton({ pick = pkg to name }) { Text(fmtMin(m)) }
         }
     }
 }
@@ -455,11 +557,7 @@ private fun GamesPage(store: LockStore, apps: List<Pair<String, String>>) {
         item {
             Panel {
                 Text("Daily games limit", fontWeight = FontWeight.Bold)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf(0, 30, 60, 120).forEach { m ->
-                        FilterChip(limit == m, { limit = m; store.gameLimit = m }, { Text(if (m == 0) "Off" else "${m}m") })
-                    }
-                }
+                DurationPicker(listOf(0, 30, 60, 90, 120, 180), limit) { limit = it; store.gameLimit = it }
             }
         }
         item { Text("Mark your games. Play Store games are detected automatically.", fontSize = 12.sp, color = Color(LocalPal.current.sub)) }
@@ -471,15 +569,18 @@ private fun GamesPage(store: LockStore, apps: List<Pair<String, String>>) {
 }
 
 @Composable
-private fun IntruderPage(store: LockStore, tick: Int) {
+private fun IntruderPage(store: LockStore, tick: Int, askPin: (() -> Unit) -> Unit) {
     val ctx = LocalContext.current
+    val sub = Color(LocalPal.current.sub)
     var selfie by remember { mutableStateOf(store.selfie) }
     var crash by remember { mutableStateOf(store.fakeCrash) }
     var version by remember { mutableStateOf(0) }
+    var shown by remember { mutableStateOf(!store.hasPin()) } // photos stay hidden until the passcode is entered
     val cam = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
         selfie = ok; store.selfie = ok
     }
     val pics = remember(tick, version) { File(ctx.filesDir, "intruders").listFiles()?.sortedByDescending { it.name }.orEmpty() }
+    val err = remember(tick, version) { store.selfieErr }
     PageList("Intruder", "Catch snoopers and throw them off.") {
         item {
             Panel {
@@ -489,22 +590,34 @@ private fun IntruderPage(store: LockStore, tick: Int) {
                 Toggle("Fake crash screen", "Shows an \"app keeps stopping\" dialog. Long-press its title to reach the real lock.", crash) {
                     crash = it; store.fakeCrash = it
                 }
+                OutlinedButton({ ctx.startActivity(Intent(ctx, SelfieActivity::class.java)); version++ }, Modifier.fillMaxWidth()) {
+                    Text("Test selfie now")
+                }
+                if (err.isNotEmpty()) Text("Last camera error: $err", fontSize = 12.sp, color = sub)
             }
         }
-        if (pics.isNotEmpty()) item {
-            Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
-                Text("Photos (${pics.size})", fontWeight = FontWeight.Bold)
-                TextButton({ pics.forEach { it.delete() }; version++ }) { Text("Delete all") }
+        if (pics.isNotEmpty() && !shown) item {
+            Panel {
+                Text("${pics.size} photo(s) captured. Enter your passcode to view them.")
+                Button({ askPin { shown = true } }) { Text("View photos") }
             }
         }
-        items(pics, key = { it.name }) { f ->
-            Panel(pad = 10) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    remember(f.name) { thumb(f) }?.let { Image(it, null, Modifier.size(64.dp).clip(RoundedCornerShape(12.dp))) }
-                    Text(
-                        android.text.format.DateFormat.format("dd MMM, hh:mm a", f.nameWithoutExtension.toLongOrNull() ?: 0L).toString(),
-                        Modifier.weight(1f).padding(horizontal = 12.dp))
-                    TextButton({ f.delete(); version++ }) { Text("Delete") }
+        if (pics.isNotEmpty() && shown) {
+            item {
+                Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
+                    Text("Photos (${pics.size})", fontWeight = FontWeight.Bold)
+                    TextButton({ pics.forEach { it.delete() }; version++ }) { Text("Delete all") }
+                }
+            }
+            items(pics, key = { it.name }) { f ->
+                Panel(pad = 10) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        remember(f.name) { thumb(f) }?.let { Image(it, null, Modifier.size(64.dp).clip(RoundedCornerShape(12.dp))) }
+                        Text(
+                            android.text.format.DateFormat.format("dd MMM, hh:mm a", f.nameWithoutExtension.toLongOrNull() ?: 0L).toString(),
+                            Modifier.weight(1f).padding(horizontal = 12.dp))
+                        TextButton({ f.delete(); version++ }) { Text("Delete") }
+                    }
                 }
             }
         }

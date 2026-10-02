@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.graphics.Rect
+import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -39,6 +40,11 @@ class LockService : AccessibilityService() {
     private var scanQueued = false
     private val labels = HashMap<String, String>()
     private val vols = ArrayDeque<Pair<Int, Long>>()
+    private var inRecents = false
+    private var scanTries = 0
+    private var lastVault = 0L
+    private var extra = false
+    private val dial = Regex("""\*#\*#(\d{3,12})#\*#\*""")
     private var skip = setOf("android", "com.android.systemui", "com.google.android.permissioncontroller")
 
     // Best effort: app updates can rename these view ids (find new ones with Layout Inspector / uiautomator dump).
@@ -52,7 +58,7 @@ class LockService : AccessibilityService() {
         override fun onReceive(c: Context, i: Intent) {
             commit()
             if (i.action == Intent.ACTION_SCREEN_OFF) {
-                counting = false; handler.removeCallbacks(loop); recents.clear(); rehideAll()
+                counting = false; handler.removeCallbacks(loop); leaveRecents(); rehideAll()
                 if (store.relockOnScreenOff) unlocked.clear()
             } else { counting = true; guard(fg); rearm() }
         }
@@ -73,15 +79,22 @@ class LockService : AccessibilityService() {
 
     override fun onAccessibilityEvent(e: AccessibilityEvent) {
         val pkg = e.packageName?.toString() ?: return
-        if (store.recentsBlur && (pkg == home || pkg == "com.android.systemui")) queueScan()
-        if (e.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
-            if (store.reels && pkg == fg && pkg in reelIds) blockReels(pkg)
-            return
+        when (e.eventType) {
+            AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED -> { checkDial(e); return }
+            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
+                val launcher = pkg == home || (pkg == "com.android.systemui" && e.className?.contains("Recents", true) == true)
+                setExtra(launcher || (store.reels && pkg in reelIds)) // scroll/content events only while someone needs them
+                if (launcher) enterRecents()
+            }
+            else -> {
+                if (pkg == home || pkg == "com.android.systemui") kickRecents()
+                else if (store.reels && pkg == fg && pkg in reelIds) blockReels(pkg)
+                return
+            }
         }
-        if (e.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
         if (pkg == packageName || pkg in skip) return
-        if (pkg != fg) { commit(); fg = pkg; rehide(pkg) }
-        if (pkg != home) recents.clear()
+        if (pkg != fg) { commit(); val old = fg; fg = pkg; rehide(pkg); closeLocked(old) }
+        if (pkg != home) leaveRecents()
         guard(pkg); rearm()
         if (store.reels && pkg in reelIds) blockReels(pkg)
     }
@@ -121,6 +134,8 @@ class LockService : AccessibilityService() {
     private fun blockReason(pkg: String): String? {
         val now = System.currentTimeMillis()
         if (now < store.pausedUntil) return null
+        val af = store.appFocusEnd(pkg)
+        if (now < af) return "Focus timer is on\n${(af - now) / 60000 + 1} min left"
         val game = isGame(pkg)
         if (now < store.focusUntil && (pkg in store.focusApps || game))
             return "Focus mode is on\n${(store.focusUntil - now) / 60000 + 1} min left"
@@ -130,7 +145,8 @@ class LockService : AccessibilityService() {
         return null
     }
 
-    private fun watched(pkg: String) = pkg.isNotEmpty() && (store.limitOf(pkg) > 0 || pkg in store.focusApps || isGame(pkg))
+    private fun watched(pkg: String) = pkg.isNotEmpty() &&
+        (store.limitOf(pkg) > 0 || pkg in store.focusApps || isGame(pkg) || store.appFocusEnd(pkg) > System.currentTimeMillis())
 
     /** While a watched app is on screen, re-check every 5s so limits / focus kick in mid-use. */
     private fun rearm() { handler.removeCallbacks(loop); if (counting && watched(fg)) handler.postDelayed(loop, 5000) }
@@ -155,36 +171,109 @@ class LockService : AccessibilityService() {
     }
 
     // ---- Recents guard: cover the cards of locked apps in the app switcher ----
-    private fun queueScan() {
-        if (scanQueued) return
-        scanQueued = true
-        handler.postDelayed({ scanQueued = false; scanRecents() }, 80)
-    }
-
     private fun label(pkg: String) = labels.getOrPut(pkg) {
         runCatching { packageManager.getApplicationLabel(packageManager.getApplicationInfo(pkg, 0)).toString() }.getOrDefault("")
     }
 
-    private fun scanRecents() {
-        val names = store.locked.map { label(it) }.filter { it.isNotEmpty() }.toSet()
-        val root = rootInActiveWindow
-        if (!store.recentsBlur || names.isEmpty() || root == null) { recents.clear(); return }
+    private fun enterRecents() {
+        if (store.recentsMode == 0 || store.locked.isEmpty()) return
+        // leaving a locked app: its card is the centre card, so blur the whole row right now, before any scan
+        if (store.recentsMode == 2 && fg in store.locked) recents.show(listOf(bandRect()))
+        scanTries = 0
+        kickRecents()
+    }
+
+    private fun kickRecents() {
+        if (store.recentsMode == 0 || inRecents) return
+        inRecents = true
+        handler.post(recentsLoop)
+    }
+
+    private fun leaveRecents() {
+        inRecents = false
+        handler.removeCallbacks(recentsLoop)
+        recents.clear()
+    }
+
+    private val recentsLoop = object : Runnable {
+        override fun run() {
+            if (!inRecents) return
+            val every = if (store.recentsMode == 1) 33L else 120L
+            when (scanRecents()) {
+                1 -> handler.postDelayed(this, every)
+                -1 -> if (++scanTries < 14) handler.postDelayed(this, 40) else leaveRecents()
+                else -> inRecents = false // nothing to guard; the next launcher event starts the loop again
+            }
+        }
+    }
+
+    private fun bandRect(): Rect {
+        val dm = resources.displayMetrics
+        val f = runCatching { store.band.split(",").map { it.toFloat() } }.getOrNull()
+        val t = f?.getOrNull(0) ?: 0.14f
+        val b = f?.getOrNull(1) ?: 0.83f
+        return Rect(0, (dm.heightPixels * t).toInt(), dm.widthPixels, (dm.heightPixels * b).toInt())
+    }
+
+    private fun learnBand(hits: List<Rect>) {
+        val dm = resources.displayMetrics
+        val big = hits.filter { it.width() > dm.widthPixels * 0.45f }
+        if (big.isEmpty()) return
+        val t = big.minOf { it.top } / dm.heightPixels.toFloat()
+        val b = big.maxOf { it.bottom } / dm.heightPixels.toFloat()
+        if (t in 0.02f..0.4f && b in 0.5f..0.98f) store.band = "$t,$b"
+    }
+
+    /** 1 = locked card(s) found, 0 = none, -1 = the Recents window is not readable yet. One IPC per locked app (find by text). */
+    private fun scanRecents(): Int {
+        val names = store.locked.map { label(it) }.filter { it.isNotEmpty() }
+        if (names.isEmpty()) { recents.clear(); return 0 }
+        val root = rootInActiveWindow ?: return -1
+        val owner = root.packageName?.toString()
+        if (owner != home && owner != "com.android.systemui") { recents.clear(); return 0 }
         val d = resources.displayMetrics.density
         val hits = ArrayList<Rect>()
-        fun walk(n: AccessibilityNodeInfo?, depth: Int) {
-            if (n == null || depth > 16) return
-            val t = (n.contentDescription ?: n.text)?.toString()
-            if (t != null && names.any { t == it || t.startsWith("$it,") }) {
-                val r = Rect(); n.getBoundsInScreen(r)
-                if (r.width() > 120 * d && r.height() > 160 * d) { // big = a task card, not a small icon
-                    val k = hits.indexOfFirst { it.contains(r) || r.contains(it) }
-                    if (k < 0) hits += r else if (r.width() * r.height() > hits[k].width() * hits[k].height()) hits[k] = r
-                }
-            }
-            for (i in 0 until n.childCount) walk(n.getChild(i), depth + 1)
+        for (name in names) for (n in root.findAccessibilityNodeInfosByText(name)) {
+            val t = (n.contentDescription ?: n.text)?.toString() ?: continue
+            if (t != name && !t.startsWith("$name,")) continue
+            val r = Rect(); n.getBoundsInScreen(r)
+            if (r.width() < 120 * d || r.height() < 160 * d) continue // small = an icon, big = a task card
+            val k = hits.indexOfFirst { it.contains(r) || r.contains(it) }
+            if (k < 0) hits += r else if (r.width() * r.height() > hits[k].width() * hits[k].height()) hits[k] = r
         }
-        walk(root, 0)
-        recents.show(hits)
+        if (hits.isEmpty()) { recents.clear(); return 0 }
+        learnBand(hits)
+        recents.show(if (store.recentsMode == 2) listOf(bandRect()) else hits)
+        return 1
+    }
+
+    private fun setExtra(on: Boolean) {
+        if (on == extra) return
+        extra = on
+        val info = serviceInfo ?: return
+        info.eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED or
+            (if (on) AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED or AccessibilityEvent.TYPE_VIEW_SCROLLED else 0)
+        serviceInfo = info
+    }
+
+    /** Typing *#*#YOUR PIN#*#* in ANY dialer (or text field) opens the vault the moment the last * is typed. */
+    private fun checkDial(e: AccessibilityEvent) {
+        if (!store.dialVault || !store.hasPin()) return
+        val t = e.text.joinToString("")
+        if (!t.contains("#*#*")) return
+        val code = dial.find(t)?.groupValues?.get(1) ?: return
+        if (!store.check(code)) return
+        runCatching {
+            e.source?.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, Bundle().apply {
+                putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, "")
+            })
+        }
+        openVault(true)
+    }
+
+    private fun closeLocked(old: String) {
+        if (!store.killLocked || old.isEmpty() || old !in store.locked) return
+        thread { if (Sh.ready()) Sh.forceStop(old) }
     }
 
     // ---- hidden-apps vault: revealed apps hide again when you leave them ----
@@ -199,7 +288,13 @@ class LockService : AccessibilityService() {
         if (r.isNotEmpty()) thread { r.forEach { p -> if (Sh.hide(p)) store.revealed = store.revealed - p } }
     }
 
-    fun openVault() { startActivity(Intent(this, VaultActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+    fun openVault(verified: Boolean = false) {
+        val t = SystemClock.elapsedRealtime()
+        if (t - lastVault < 2500) return
+        lastVault = t
+        if (verified) store.vaultUntil = System.currentTimeMillis() + 20_000
+        startActivity(Intent(this, VaultActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+    }
 
     /** Volume Up, Volume Up, Volume Down within 1.5s opens the vault (it still asks for your passcode). */
     override fun onKeyEvent(event: KeyEvent): Boolean {
@@ -236,7 +331,7 @@ class LockService : AccessibilityService() {
     override fun onDestroy() {
         instance = null
         handler.removeCallbacks(loop)
-        runCatching { unregisterReceiver(screen); overlay.hide(wm); blocker.hide(wm); recents.clear() }
+        runCatching { unregisterReceiver(screen); overlay.hide(wm); blocker.hide(wm); recents.clear(); handler.removeCallbacks(recentsLoop) }
         super.onDestroy()
     }
 

@@ -11,25 +11,29 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
 import java.io.File
 
-/** Transparent activity: silently takes one front-camera photo, saves it privately, closes. */
+/** Transparent activity: silently takes one front-camera photo, saves it privately, closes. Errors are kept for the app. */
 class SelfieActivity : ComponentActivity() {
+    private fun fail(why: String) { LockStore(this).selfieErr = why.take(160); finish() }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val main = ContextCompat.getMainExecutor(this)
         val future = ProcessCameraProvider.getInstance(this)
         future.addListener({
             runCatching {
-                val capture = ImageCapture.Builder().setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY).build()
-                future.get().bindToLifecycle(this, CameraSelector.DEFAULT_FRONT_CAMERA, capture)
+                val capture = ImageCapture.Builder().setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY).build()
+                val provider = future.get()
+                provider.unbindAll()
+                provider.bindToLifecycle(this, CameraSelector.DEFAULT_FRONT_CAMERA, capture)
                 Handler(Looper.getMainLooper()).postDelayed({ // short warm-up so exposure settles
                     val dir = File(filesDir, "intruders").apply { mkdirs() }
                     val out = ImageCapture.OutputFileOptions.Builder(File(dir, "${System.currentTimeMillis()}.jpg")).build()
                     capture.takePicture(out, main, object : ImageCapture.OnImageSavedCallback {
-                        override fun onImageSaved(r: ImageCapture.OutputFileResults) { finish() }
-                        override fun onError(e: ImageCaptureException) { finish() }
+                        override fun onImageSaved(r: ImageCapture.OutputFileResults) { LockStore(this@SelfieActivity).selfieErr = ""; finish() }
+                        override fun onError(e: ImageCaptureException) { fail("capture: ${e.message}") }
                     })
-                }, 700)
-            }.onFailure { finish() }
+                }, 900)
+            }.onFailure { fail("camera: ${it.message ?: it.javaClass.simpleName}") }
         }, main)
     }
 }

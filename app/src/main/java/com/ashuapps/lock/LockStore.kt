@@ -92,6 +92,37 @@ class LockStore(ctx: Context) {
     var revealAt: Long
         get() = p.getLong("revat", 0)
         set(v) = p.edit().putLong("revat", v).apply()
+    var dialVault: Boolean // *#*#PIN#*#* typed in any dialer opens the vault
+        get() = p.getBoolean("dial", true)
+        set(v) = p.edit().putBoolean("dial", v).apply()
+    var lockSelf: Boolean // ask for the passcode when this app opens
+        get() = p.getBoolean("lself", false)
+        set(v) = p.edit().putBoolean("lself", v).apply()
+    var killLocked: Boolean // force-stop locked apps when you leave them (Shizuku): they vanish from Recents
+        get() = p.getBoolean("kill", false)
+        set(v) = p.edit().putBoolean("kill", v).apply()
+    var recentsMode: Int // 0 off, 1 smart (cover locked cards), 2 strict (blur the whole card row)
+        get() = p.getInt("rmode", 2)
+        set(v) = p.edit().putInt("rmode", v).apply()
+    var vaultUntil: Long // set after a verified dial code so the vault skips its own prompt
+        get() = p.getLong("vuntil", 0)
+        set(v) = p.edit().putLong("vuntil", v).apply()
+    var focusTotal: Long
+        get() = p.getLong("ftotal", 0)
+        set(v) = p.edit().putLong("ftotal", v).apply()
+    var appFocus: Set<String> // "pkg|endMillis": a separate focus timer per app
+        get() = p.getStringSet("afocus", emptySet()) ?: emptySet()
+        set(v) = p.edit().putStringSet("afocus", HashSet(v)).apply()
+    var selfieErr: String
+        get() = p.getString("serr", "") ?: ""
+        set(v) = p.edit().putString("serr", v).apply()
+    var band: String // learned top,bottom of the Recents card row (screen fractions)
+        get() = p.getString("band", "0.14,0.83") ?: "0.14,0.83"
+        set(v) = p.edit().putString("band", v).apply()
+    fun appFocusEnd(pkg: String) = appFocus.firstOrNull { it.startsWith("$pkg|") }?.substringAfter('|')?.toLongOrNull() ?: 0L
+    fun setAppFocus(pkg: String, end: Long) {
+        appFocus = appFocus.filterNot { it.startsWith("$pkg|") }.toSet() + (if (end > 0) setOf("$pkg|$end") else emptySet())
+    }
     val pinLen get() = p.getInt("len", 4)
     fun hasPin() = p.contains("h")
 
